@@ -1,0 +1,13 @@
+name: MyNotes
+version: 1.0.0
+main: aiptu\mynotes\MyNotes
+api: [5.0.0]
+author: AIPTU
+commands:
+  notes:
+    description: Write a note.
+    permission: mynotes..command
+permissions:
+  mynotes..command:
+    description: /notes command.
+    default: true

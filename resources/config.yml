@@ -34,7 +34,7 @@ messages:
   no_players_online: "§cThere are no other players online to share your note with."  # Message when no players are online to share with
   command_only_ingame: "§cThis command can only be used in-game."  # Error when a command is used outside of the game
   confirm_delete_note: "§eAre you sure you want to delete the note: §c%s?"  # Confirmation prompt for deleting a note
-  confirm_share_note: "§eAre you sure you want to share the note: §c%s?"  # Confirmation prompt for sharing a note
+  confirm_share_note: "§eAre you sure you want to share the note: §c%s §eto §6%s?"  # Confirmation prompt for sharing a note
   note_title_empty: "§cNote title cannot be empty."  # Error when a note title is empty
   note_title_exists: "§cA note with the title '%s' already exists."  # Error when a note title already exists
 

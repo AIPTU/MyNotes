@@ -18,7 +18,6 @@ use InvalidArgumentException;
 use jojoe77777\FormAPI\CustomForm;
 use jojoe77777\FormAPI\ModalForm;
 use jojoe77777\FormAPI\SimpleForm;
-use PDO;
 use pocketmine\command\Command;
 use pocketmine\command\CommandSender;
 use pocketmine\player\Player;
@@ -26,7 +25,9 @@ use pocketmine\plugin\DisablePluginException;
 use pocketmine\plugin\PluginBase;
 use pocketmine\utils\Config;
 use pocketmine\utils\TextFormat;
-use Symfony\Component\Filesystem\Path;
+use poggit\libasynql\DataConnector;
+use poggit\libasynql\libasynql;
+use poggit\libasynql\SqlError;
 use function array_filter;
 use function array_keys;
 use function array_map;
@@ -44,7 +45,7 @@ use function strtolower;
 use function trim;
 
 class MyNotes extends PluginBase {
-	private PDO $db;
+	private DataConnector $db;
 
 	private array $titles = [];
 	private array $messages = [];
@@ -61,13 +62,21 @@ class MyNotes extends PluginBase {
 			throw new DisablePluginException();
 		}
 
-		$this->db = new PDO('sqlite:' . Path::join($this->getDataFolder(), 'playerNotes.db'));
-		$this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-		$this->db->exec('CREATE TABLE IF NOT EXISTS notes (player_name TEXT NOT NULL, note_title TEXT NOT NULL, note_content TEXT, created_at TEXT, modified_at TEXT, pinned INTEGER, PRIMARY KEY (player_name, note_title))');
+		$this->db = libasynql::create($this, $this->getConfig()->get('database'), [
+			'sqlite' => 'sqlite.sql',
+			'mysql' => 'mysql.sql',
+		]);
+
+		$this->db->executeGeneric('notes.create');
+		$this->db->waitAll();
+	}
+
+	public function onDisable() : void {
+		$this->db->close();
 	}
 
 	/**
-	 * Loads and validates the plugin configuration from the `config.yml` file.
+	 * Loads and validates the plugin configuration from the config.yml file.
 	 * If the configuration is invalid, an exception will be thrown.
 	 *
 	 * @throws InvalidArgumentException when the configuration is invalid
@@ -119,45 +128,54 @@ class MyNotes extends PluginBase {
 		return $this->icons[$keyWithoutPrefix] ?? 'Default Icon';
 	}
 
-	private function getPlayerNotes(Player $player) : array {
-		$stmt = $this->db->prepare('SELECT note_title, note_content, created_at, modified_at, pinned FROM notes WHERE player_name = :player_name');
-		$stmt->execute([':player_name' => strtolower($player->getName())]);
-		$notes = $stmt->fetchAll(PDO::FETCH_ASSOC);
-		return $this->formatNotes($notes);
+	private function getPlayerNotes(Player $player, callable $callback) : void {
+		$this->db->executeSelect('notes.select_all', [
+			'player_uuid' => $player->getUniqueId()->toString(),
+		], function (array $rows) use ($callback) : void {
+			$notes = $this->formatNotes($rows);
+			$callback($notes);
+		}, function (SqlError $error) : void {
+			$this->getLogger()->error('Failed to fetch player notes: ' . $error->getErrorMessage());
+		});
 	}
 
 	private function saveNoteForPlayer(Player $player, string $title, array $note) : void {
-		$stmt = $this->db->prepare('INSERT INTO notes (player_name, note_title, note_content, created_at, modified_at, pinned) VALUES (:player_name, :note_title, :note_content, :created_at, :modified_at, :pinned) ON CONFLICT(player_name, note_title) DO UPDATE SET note_content = excluded.note_content, modified_at = excluded.modified_at, pinned = excluded.pinned');
-		$stmt->execute([
-			':player_name' => strtolower($player->getName()),
-			':note_title' => $title,
-			':note_content' => $note['content'],
-			':created_at' => $note['created'],
-			':modified_at' => $note['modified'],
-			':pinned' => $note['pinned'] ? 1 : 0,
-		]);
+		$this->db->executeInsert('notes.insert', [
+			'player_uuid' => $player->getUniqueId()->toString(),
+			'note_title' => $title,
+			'note_content' => $note['content'],
+			'created_at' => $note['created'],
+			'modified_at' => $note['modified'],
+			'pinned' => $note['pinned'] ? 1 : 0,
+		], null, function (SqlError $error) : void {
+			$this->getLogger()->error('Failed to save player note: ' . $error->getErrorMessage());
+		});
 	}
 
 	private function deleteNoteForPlayer(Player $player, string $noteTitle) : void {
-		$stmt = $this->db->prepare('DELETE FROM notes WHERE player_name = :player_name AND note_title = :note_title');
-		$stmt->execute([
-			':player_name' => strtolower($player->getName()),
-			':note_title' => $noteTitle,
-		]);
+		$this->db->executeChange('notes.delete', [
+			'player_uuid' => $player->getUniqueId()->toString(),
+			'note_title' => $noteTitle,
+		], null, function (SqlError $error) : void {
+			$this->getLogger()->error('Failed to delete player note: ' . $error->getErrorMessage());
+		});
 	}
 
-	private function getNoteForPlayer(Player $player, string $noteTitle) : ?array {
-		$stmt = $this->db->prepare('SELECT note_content, created_at, modified_at, pinned FROM notes WHERE player_name = :player_name AND note_title = :note_title');
-		$stmt->execute([
-			':player_name' => strtolower($player->getName()),
-			':note_title' => $noteTitle,
-		]);
-		$note = $stmt->fetch(PDO::FETCH_ASSOC);
-		if (!is_array($note)) {
-			return null;
-		}
+	private function getNoteForPlayer(Player $player, string $noteTitle, callable $callback) : void {
+		$this->db->executeSelect('notes.select_single', [
+			'player_uuid' => $player->getUniqueId()->toString(),
+			'note_title' => $noteTitle,
+		], function (array $rows) use ($callback) : void {
+			if (count($rows) === 0) {
+				$callback(null);
+				return;
+			}
 
-		return $this->formatNote($note);
+			$note = $this->formatNote($rows[0]);
+			$callback($note);
+		}, function (SqlError $error) : void {
+			$this->getLogger()->error('Failed to fetch single player note: ' . $error->getErrorMessage());
+		});
 	}
 
 	private function formatNotes(array $notes) : array {
@@ -229,39 +247,41 @@ class MyNotes extends PluginBase {
 	}
 
 	public function openMainMenu(Player $player) : void {
-		$notesCount = count($this->getPlayerNotes($player));
+		$this->getPlayerNotes($player, function (array $notes) use ($player) : void {
+			$notesCount = count($notes);
 
-		$buttons = [
-			['text' => $this->getButton(ConfigKeys::BUTTON_CREATE_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_CREATE)],
-		];
+			$buttons = [
+				['text' => $this->getButton(ConfigKeys::BUTTON_CREATE_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_CREATE)],
+			];
 
-		if ($notesCount > 0) {
-			$buttons = array_merge($buttons, [
-				['text' => $this->getButton(ConfigKeys::BUTTON_DELETE_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_DELETE)],
-				['text' => $this->getButton(ConfigKeys::BUTTON_VIEW_NOTES), 'imagePath' => $this->getIcon(ConfigKeys::ICON_VIEW)],
-				['text' => $this->getButton(ConfigKeys::BUTTON_EDIT_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_EDIT)],
-				['text' => $this->getButton(ConfigKeys::BUTTON_SHARE_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_SHARE)],
-			]);
-		}
-
-		$this->displaySimpleForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_MAIN_MENU),
-			$notesCount > 0
-				? $this->getMessage(ConfigKeys::MESSAGE_SELECT_ACTION) . "\n\n§aYou have §e{$notesCount} §anotes."
-				: $this->getMessage(ConfigKeys::MESSAGE_NO_NOTES),
-			$buttons,
-			function (Player $player, ?int $data = null) : void {
-				match ($data) {
-					0 => $this->openNewNoteForm($player),
-					1 => $this->openDeleteNoteForm($player),
-					2 => $this->openViewNotesForm($player),
-					3 => $this->openEditNoteForm($player),
-					4 => $this->openShareNoteForm($player),
-					default => null,
-				};
+			if ($notesCount > 0) {
+				$buttons = array_merge($buttons, [
+					['text' => $this->getButton(ConfigKeys::BUTTON_DELETE_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_DELETE)],
+					['text' => $this->getButton(ConfigKeys::BUTTON_VIEW_NOTES), 'imagePath' => $this->getIcon(ConfigKeys::ICON_VIEW)],
+					['text' => $this->getButton(ConfigKeys::BUTTON_EDIT_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_EDIT)],
+					['text' => $this->getButton(ConfigKeys::BUTTON_SHARE_NOTE), 'imagePath' => $this->getIcon(ConfigKeys::ICON_SHARE)],
+				]);
 			}
-		);
+
+			$this->displaySimpleForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_MAIN_MENU),
+				$notesCount > 0
+					? $this->getMessage(ConfigKeys::MESSAGE_SELECT_ACTION) . "\n\n§aYou have §e{$notesCount} §anotes."
+					: $this->getMessage(ConfigKeys::MESSAGE_NO_NOTES),
+				$buttons,
+				function (Player $player, ?int $data = null) : void {
+					match ($data) {
+						0 => $this->openNewNoteForm($player),
+						1 => $this->openDeleteNoteForm($player),
+						2 => $this->openViewNotesForm($player),
+						3 => $this->openEditNoteForm($player),
+						4 => $this->openShareNoteForm($player),
+						default => null,
+					};
+				}
+			);
+		});
 	}
 
 	public function openNewNoteForm(Player $player) : void {
@@ -287,29 +307,31 @@ class MyNotes extends PluginBase {
 					return;
 				}
 
-				if ($this->getNoteForPlayer($player, $title) !== null) {
-					$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_TITLE_EXISTS), $title));
-					$this->openNewNoteForm($player);
-					return;
-				}
+				$this->getNoteForPlayer($player, $title, function (?array $existingNote) use ($player, $title, $content, $pinned) : void {
+					if ($existingNote !== null) {
+						$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_TITLE_EXISTS), $title));
+						$this->openNewNoteForm($player);
+						return;
+					}
 
-				$content = str_replace('{line}', "\n", $content);
+					$content = str_replace('{line}', "\n", $content);
 
-				$noteData = [
-					'content' => $content,
-					'created' => (new DateTimeImmutable())->format(self::DATE_TIME_FORMAT),
-					'modified' => (new DateTimeImmutable())->format(self::DATE_TIME_FORMAT),
-					'pinned' => $pinned,
-				];
+					$noteData = [
+						'content' => $content,
+						'created' => (new DateTimeImmutable())->format(self::DATE_TIME_FORMAT),
+						'modified' => (new DateTimeImmutable())->format(self::DATE_TIME_FORMAT),
+						'pinned' => $pinned,
+					];
 
-				$this->saveNoteForPlayer($player, $title, $noteData);
-				$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_CREATED), $title));
+					$this->saveNoteForPlayer($player, $title, $noteData);
+					$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_CREATED), $title));
 
-				if ($pinned) {
-					$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_PINNED), $title));
-				}
+					if ($pinned) {
+						$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_PINNED), $title));
+					}
 
-				$this->openMainMenu($player);
+					$this->openMainMenu($player);
+				});
 			}
 		);
 	}
@@ -343,78 +365,80 @@ class MyNotes extends PluginBase {
 	}
 
 	public function openViewNotesForm(Player $player) : void {
-		$notes = $this->getPlayerNotes($player);
-		[$buttons, $allNotes] = $this->createNoteButtons($notes);
+		$this->getPlayerNotes($player, function (array $notes) use ($player) : void {
+			[$buttons, $allNotes] = $this->createNoteButtons($notes);
 
-		$this->displaySimpleForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_VIEW_NOTES),
-			$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE),
-			$buttons,
-			function (Player $player, ?int $data = null) use ($allNotes) : void {
-				if ($data === null || !isset($allNotes[$data])) {
-					$this->openMainMenu($player);
-					return;
+			$this->displaySimpleForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_VIEW_NOTES),
+				$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE),
+				$buttons,
+				function (Player $player, ?int $data = null) use ($allNotes) : void {
+					if ($data === null || !isset($allNotes[$data])) {
+						$this->openMainMenu($player);
+						return;
+					}
+
+					$noteTitle = $allNotes[$data];
+					$this->openNoteContentForm($player, (string) $noteTitle);
 				}
-
-				$noteTitle = $allNotes[$data];
-				$this->openNoteContentForm($player, (string) $noteTitle);
-			}
-		);
+			);
+		});
 	}
 
 	public function openNoteContentForm(Player $player, string $noteTitle) : void {
-		$note = $this->getNoteForPlayer($player, $noteTitle);
-
-		if ($note === null) {
-			$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_NOT_FOUND));
-			return;
-		}
-
-		$content = $note['content'] ?? '';
-		$created = $note['created'] ?? 'Unknown';
-		$modified = $note['modified'] ?? 'Unknown';
-		$pinned = $note['pinned'] ? 'Yes' : 'No';
-
-		$message = sprintf(
-			"§eTitle: §6%s\n§eCreated: §6%s\n§eModified: §6%s\n§ePinned: §6%s\n\n§6%s",
-			TextFormat::colorize($noteTitle),
-			$created,
-			$modified,
-			$pinned,
-			TextFormat::colorize($content)
-		);
-
-		$this->displaySimpleForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_NOTE_CONTENT),
-			$message,
-			[['text' => $this->getButton(ConfigKeys::BUTTON_BACK), 'imagePath' => $this->getIcon(ConfigKeys::ICON_BACK)]],
-			function (Player $player, ?int $data = null) : void {
-				$this->openMainMenu($player);
+		$this->getNoteForPlayer($player, $noteTitle, function (?array $note) use ($player, $noteTitle) : void {
+			if ($note === null) {
+				$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_NOT_FOUND));
+				return;
 			}
-		);
+
+			$content = $note['content'] ?? '';
+			$created = $note['created'] ?? 'Unknown';
+			$modified = $note['modified'] ?? 'Unknown';
+			$pinned = $note['pinned'] ? 'Yes' : 'No';
+
+			$message = sprintf(
+				"§eTitle: §6%s\n§eCreated: §6%s\n§eModified: §6%s\n§ePinned: §6%s\n\n§6%s",
+				TextFormat::colorize($noteTitle),
+				$created,
+				$modified,
+				$pinned,
+				TextFormat::colorize($content)
+			);
+
+			$this->displaySimpleForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_NOTE_CONTENT),
+				$message,
+				[['text' => $this->getButton(ConfigKeys::BUTTON_BACK), 'imagePath' => $this->getIcon(ConfigKeys::ICON_BACK)]],
+				function (Player $player, ?int $data = null) : void {
+					$this->openMainMenu($player);
+				}
+			);
+		});
 	}
 
 	public function openDeleteNoteForm(Player $player) : void {
-		$notes = $this->getPlayerNotes($player);
-		[$buttons, $allNotes] = $this->createNoteButtons($notes);
+		$this->getPlayerNotes($player, function (array $notes) use ($player) : void {
+			[$buttons, $allNotes] = $this->createNoteButtons($notes);
 
-		$this->displaySimpleForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_DELETE_NOTE),
-			$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE_DELETE),
-			$buttons,
-			function (Player $player, ?int $data = null) use ($allNotes) : void {
-				if ($data === null || !isset($allNotes[$data])) {
-					$this->openMainMenu($player);
-					return;
+			$this->displaySimpleForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_DELETE_NOTE),
+				$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE_DELETE),
+				$buttons,
+				function (Player $player, ?int $data = null) use ($allNotes) : void {
+					if ($data === null || !isset($allNotes[$data])) {
+						$this->openMainMenu($player);
+						return;
+					}
+
+					$noteTitle = $allNotes[$data];
+					$this->confirmDeleteNoteForm($player, (string) $noteTitle);
 				}
-
-				$noteTitle = $allNotes[$data];
-				$this->confirmDeleteNoteForm($player, (string) $noteTitle);
-			}
-		);
+			);
+		});
 	}
 
 	public function confirmDeleteNoteForm(Player $player, string $noteTitle) : void {
@@ -441,123 +465,127 @@ class MyNotes extends PluginBase {
 	}
 
 	public function openEditNoteForm(Player $player) : void {
-		$notes = $this->getPlayerNotes($player);
-		[$buttons, $allNotes] = $this->createNoteButtons($notes);
+		$this->getPlayerNotes($player, function (array $notes) use ($player) : void {
+			[$buttons, $allNotes] = $this->createNoteButtons($notes);
 
-		$this->displaySimpleForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_EDIT_NOTE),
-			$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE_EDIT),
-			$buttons,
-			function (Player $player, ?int $data = null) use ($allNotes) : void {
-				if ($data === null || !isset($allNotes[$data])) {
-					$this->openMainMenu($player);
-					return;
+			$this->displaySimpleForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_EDIT_NOTE),
+				$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE_EDIT),
+				$buttons,
+				function (Player $player, ?int $data = null) use ($allNotes) : void {
+					if ($data === null || !isset($allNotes[$data])) {
+						$this->openMainMenu($player);
+						return;
+					}
+
+					$noteTitle = $allNotes[$data];
+					$this->openEditNoteDetailForm($player, (string) $noteTitle);
 				}
-
-				$noteTitle = $allNotes[$data];
-				$this->openEditNoteDetailForm($player, (string) $noteTitle);
-			}
-		);
+			);
+		});
 	}
 
 	public function openEditNoteDetailForm(Player $player, string $noteTitle) : void {
-		$note = $this->getNoteForPlayer($player, $noteTitle);
-
-		if ($note === null) {
-			$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_NOT_FOUND));
-			return;
-		}
-
-		$notePinned = (bool) $note['pinned'];
-
-		$this->displayCustomForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_EDIT_NOTE),
-			[
-				['label' => 'Title:', 'placeholder' => 'Enter note title', 'default' => $noteTitle],
-				['label' => 'Content:', 'placeholder' => 'Enter note content', 'default' => $note['content']],
-				['label' => 'Pin this note?', 'type' => 'toggle', 'default' => $notePinned],
-			],
-			function (Player $player, ?array $data = null) use ($noteTitle, $note, $notePinned) : void {
-				if ($data === null) {
-					return;
-				}
-
-				[$newTitle, $newContent, $pinned] = array_pad($data, 3, '');
-				$newTitle = trim($newTitle);
-				$pinned = (bool) $pinned;
-
-				if ($newTitle === '') {
-					$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_TITLE_EMPTY));
-					$this->openEditNoteDetailForm($player, $noteTitle);
-					return;
-				}
-
-				if ($newTitle !== $noteTitle && $this->getNoteForPlayer($player, $newTitle) !== null) {
-					$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_TITLE_EXISTS), $newTitle));
-					$this->openEditNoteDetailForm($player, $noteTitle);
-					return;
-				}
-
-				$newContent = str_replace('{line}', "\n", $newContent);
-
-				$contentChanged = $newContent !== $note['content'];
-				$titleChanged = $newTitle !== $noteTitle;
-				$pinChanged = $pinned !== $notePinned;
-
-				if (!$contentChanged && !$titleChanged && !$pinChanged) {
-					$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NO_CHANGES));
-					$this->openMainMenu($player);
-					return;
-				}
-
-				$noteData = array_merge($note, [
-					'content' => $newContent,
-					'modified' => (new DateTimeImmutable())->format(self::DATE_TIME_FORMAT),
-					'pinned' => $pinned,
-				]);
-
-				if ($titleChanged) {
-					$this->deleteNoteForPlayer($player, $noteTitle);
-					$this->saveNoteForPlayer($player, $newTitle, $noteData);
-					$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_RENAMED), $noteTitle, $newTitle));
-				} else {
-					$this->saveNoteForPlayer($player, $noteTitle, $noteData);
-					$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_UPDATED), $noteTitle));
-				}
-
-				if ($pinChanged) {
-					$pinMessage = $pinned
-						? sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_PINNED), $newTitle)
-						: sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_UNPINNED), $newTitle);
-					$player->sendMessage($pinMessage);
-				}
-
-				$this->openMainMenu($player);
+		$this->getNoteForPlayer($player, $noteTitle, function (?array $note) use ($player, $noteTitle) : void {
+			if ($note === null) {
+				$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_NOT_FOUND));
+				return;
 			}
-		);
+
+			$notePinned = (bool) $note['pinned'];
+
+			$this->displayCustomForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_EDIT_NOTE),
+				[
+					['label' => 'Title:', 'placeholder' => 'Enter note title', 'default' => $noteTitle],
+					['label' => 'Content:', 'placeholder' => 'Enter note content', 'default' => $note['content']],
+					['label' => 'Pin this note?', 'type' => 'toggle', 'default' => $notePinned],
+				],
+				function (Player $player, ?array $data = null) use ($noteTitle, $note, $notePinned) : void {
+					if ($data === null) {
+						return;
+					}
+
+					[$newTitle, $newContent, $pinned] = array_pad($data, 3, '');
+					$newTitle = trim($newTitle);
+					$pinned = (bool) $pinned;
+
+					if ($newTitle === '') {
+						$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_TITLE_EMPTY));
+						$this->openEditNoteDetailForm($player, $noteTitle);
+						return;
+					}
+
+					$this->getNoteForPlayer($player, $newTitle, function (?array $existingNote) use ($player, $noteTitle, $newTitle, $newContent, $pinned, $note, $notePinned) : void {
+						if ($newTitle !== $noteTitle && $existingNote !== null) {
+							$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_TITLE_EXISTS), $newTitle));
+							$this->openEditNoteDetailForm($player, $noteTitle);
+							return;
+						}
+
+						$newContent = str_replace('{line}', "\n", $newContent);
+
+						$contentChanged = $newContent !== $note['content'];
+						$titleChanged = $newTitle !== $noteTitle;
+						$pinChanged = $pinned !== $notePinned;
+
+						if (!$contentChanged && !$titleChanged && !$pinChanged) {
+							$player->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NO_CHANGES));
+							$this->openMainMenu($player);
+							return;
+						}
+
+						$noteData = array_merge($note, [
+							'content' => $newContent,
+							'modified' => (new DateTimeImmutable())->format(self::DATE_TIME_FORMAT),
+							'pinned' => $pinned,
+						]);
+
+						if ($titleChanged) {
+							$this->deleteNoteForPlayer($player, $noteTitle);
+							$this->saveNoteForPlayer($player, $newTitle, $noteData);
+							$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_RENAMED), $noteTitle, $newTitle));
+						} else {
+							$this->saveNoteForPlayer($player, $noteTitle, $noteData);
+							$player->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_UPDATED), $noteTitle));
+						}
+
+						if ($pinChanged) {
+							$pinMessage = $pinned
+								? sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_PINNED), $newTitle)
+								: sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_UNPINNED), $newTitle);
+							$player->sendMessage($pinMessage);
+						}
+
+						$this->openMainMenu($player);
+					});
+				}
+			);
+		});
 	}
 
 	public function openShareNoteForm(Player $player) : void {
-		$notes = $this->getPlayerNotes($player);
-		[$buttons, $allNotes] = $this->createNoteButtons($notes);
+		$this->getPlayerNotes($player, function (array $notes) use ($player) : void {
+			[$buttons, $allNotes] = $this->createNoteButtons($notes);
 
-		$this->displaySimpleForm(
-			$player,
-			$this->getTitle(ConfigKeys::TITLE_SHARE_NOTE),
-			$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE_SHARE),
-			$buttons,
-			function (Player $player, ?int $data = null) use ($allNotes) : void {
-				if ($data === null || !isset($allNotes[$data])) {
-					$this->openMainMenu($player);
-					return;
+			$this->displaySimpleForm(
+				$player,
+				$this->getTitle(ConfigKeys::TITLE_SHARE_NOTE),
+				$this->getMessage(ConfigKeys::MESSAGE_SELECT_NOTE_SHARE),
+				$buttons,
+				function (Player $player, ?int $data = null) use ($allNotes) : void {
+					if ($data === null || !isset($allNotes[$data])) {
+						$this->openMainMenu($player);
+						return;
+					}
+
+					$noteTitle = $allNotes[$data];
+					$this->openShareNotePlayerForm($player, (string) $noteTitle);
 				}
-
-				$noteTitle = $allNotes[$data];
-				$this->openShareNotePlayerForm($player, (string) $noteTitle);
-			}
-		);
+			);
+		});
 	}
 
 	public function openShareNotePlayerForm(Player $player, string $noteTitle) : void {
@@ -617,17 +645,17 @@ class MyNotes extends PluginBase {
 	}
 
 	public function shareNoteWithPlayer(Player $sender, Player $recipient, string $noteTitle) : void {
-		$note = $this->getNoteForPlayer($sender, $noteTitle);
+		$this->getNoteForPlayer($sender, $noteTitle, function (?array $note) use ($sender, $recipient, $noteTitle) : void {
+			if ($note === null) {
+				$sender->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_NOT_FOUND));
+				return;
+			}
 
-		if ($note === null) {
-			$sender->sendMessage($this->getMessage(ConfigKeys::MESSAGE_NOTE_NOT_FOUND));
-			return;
-		}
+			$this->saveNoteForPlayer($recipient, $noteTitle, $note);
 
-		$this->saveNoteForPlayer($recipient, $noteTitle, $note);
-
-		$sender->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_SHARED), $noteTitle, $recipient->getName()));
-		$recipient->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_RECEIVED), $noteTitle, $sender->getName()));
+			$sender->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_SHARED), $noteTitle, $recipient->getName()));
+			$recipient->sendMessage(sprintf($this->getMessage(ConfigKeys::MESSAGE_NOTE_RECEIVED), $noteTitle, $sender->getName()));
+		});
 	}
 
 	public function onCommand(CommandSender $sender, Command $command, string $label, array $args) : bool {

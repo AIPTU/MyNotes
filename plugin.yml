@@ -5,9 +5,9 @@ api: [5.0.0]
 author: AIPTU
 commands:
   notes:
-    description: Write a note.
-    permission: mynotes..command
+    description: Opens the main menu for managing notes.
+    permission: mynotes.command
 permissions:
-  mynotes..command:
-    description: /notes command.
+  mynotes.command:
+    description: Allows the player to use the `/notes` command.
     default: true
